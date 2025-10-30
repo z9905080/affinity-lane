@@ -12,52 +12,58 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// MockHandler is a simple task handler for testing
-type MockHandler struct {
+// TaskTracker tracks executed tasks for testing
+type TaskTracker struct {
 	mu       sync.Mutex
-	executed map[string][]*types.Task // sessionID -> tasks
-	delay    time.Duration
+	executed map[string][]string // sessionID -> taskIDs
 }
 
-func NewMockHandler(delay time.Duration) *MockHandler {
-	return &MockHandler{
-		executed: make(map[string][]*types.Task),
-		delay:    delay,
+func NewTaskTracker() *TaskTracker {
+	return &TaskTracker{
+		executed: make(map[string][]string),
 	}
 }
 
-func (h *MockHandler) Handle(ctx context.Context, task *types.Task) (*types.TaskResult, error) {
-	if h.delay > 0 {
-		time.Sleep(h.delay)
-	}
-
-	h.mu.Lock()
-	h.executed[task.SessionID] = append(h.executed[task.SessionID], task)
-	h.mu.Unlock()
-
-	return &types.TaskResult{
-		TaskID:    task.ID,
-		SessionID: task.SessionID,
-		Result:    "success",
-	}, nil
+func (t *TaskTracker) RecordTask(sessionID, taskID string) {
+	t.mu.Lock()
+	t.executed[sessionID] = append(t.executed[sessionID], taskID)
+	t.mu.Unlock()
 }
 
-func (h *MockHandler) GetExecutedTasks(sessionID string) []*types.Task {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.executed[sessionID]
+func (t *TaskTracker) GetExecutedTaskIDs(sessionID string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.executed[sessionID]
+}
+
+// createTestTask creates a generic task for testing
+func createTestTask(id, sessionID string, payload any, delay time.Duration, tracker *TaskTracker) *types.Task[any] {
+	return &types.Task[any]{
+		ID:        id,
+		SessionID: sessionID,
+		Payload:   payload,
+		CreatedAt: time.Now(),
+		OnExecute: func(ctx context.Context, task *types.Task[any]) (any, error) {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			if tracker != nil {
+				tracker.RecordTask(task.SessionID, task.ID)
+			}
+			return "success", nil
+		},
+	}
 }
 
 func TestNewDispatcher(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    5,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
+		PoolSize:        5,
+		QueueSize:       100,
+		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(0)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	require.NotNil(t, d)
 
@@ -71,23 +77,18 @@ func TestNewDispatcher(t *testing.T) {
 
 func TestDispatcher_Submit(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    3,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
+		PoolSize:        3,
+		QueueSize:       100,
+		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(10 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
 
 	// Submit a task
-	task := &types.Task{
-		ID:        "task1",
-		SessionID: "session1",
-		Payload:   "data",
-	}
+	task := createTestTask("task1", "session1", "data", 10*time.Millisecond, nil)
 
 	err = d.Submit(context.Background(), task)
 	assert.NoError(t, err)
@@ -102,14 +103,13 @@ func TestDispatcher_Submit(t *testing.T) {
 
 func TestDispatcher_SessionAffinity(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    3,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
+		PoolSize:        3,
+		QueueSize:       100,
+		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(10 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
 
@@ -118,11 +118,7 @@ func TestDispatcher_SessionAffinity(t *testing.T) {
 	numTasks := 10
 
 	for i := 0; i < numTasks; i++ {
-		task := &types.Task{
-			ID:        fmt.Sprintf("task%d", i),
-			SessionID: sessionID,
-			Payload:   i,
-		}
+		task := createTestTask(fmt.Sprintf("task%d", i), sessionID, i, 10*time.Millisecond, nil)
 		err := d.Submit(context.Background(), task)
 		require.NoError(t, err)
 	}
@@ -150,16 +146,17 @@ func TestDispatcher_SessionAffinity(t *testing.T) {
 
 func TestDispatcher_TaskOrdering(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    2,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
+		PoolSize:        2,
+		QueueSize:       100,
+		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(5 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
+
+	tracker := NewTaskTracker()
 
 	// Submit tasks in order
 	sessionID := "session1"
@@ -170,11 +167,7 @@ func TestDispatcher_TaskOrdering(t *testing.T) {
 		taskID := fmt.Sprintf("task%d", i)
 		expectedOrder[i] = taskID
 
-		task := &types.Task{
-			ID:        taskID,
-			SessionID: sessionID,
-			Payload:   i,
-		}
+		task := createTestTask(taskID, sessionID, i, 5*time.Millisecond, tracker)
 		err := d.Submit(context.Background(), task)
 		require.NoError(t, err)
 	}
@@ -183,27 +176,28 @@ func TestDispatcher_TaskOrdering(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	// Verify execution order
-	executedTasks := handler.GetExecutedTasks(sessionID)
+	executedTasks := tracker.GetExecutedTaskIDs(sessionID)
 	require.Len(t, executedTasks, numTasks)
 
-	for i, task := range executedTasks {
-		assert.Equal(t, expectedOrder[i], task.ID,
-			"Task %d should be %s but got %s", i, expectedOrder[i], task.ID)
+	for i, taskID := range executedTasks {
+		assert.Equal(t, expectedOrder[i], taskID,
+			"Task %d should be %s but got %s", i, expectedOrder[i], taskID)
 	}
 }
 
 func TestDispatcher_MultipleSessionsConcurrent(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    5,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
+		PoolSize:        5,
+		QueueSize:       100,
+		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(5 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
+
+	tracker := NewTaskTracker()
 
 	// Submit tasks from multiple sessions concurrently
 	numSessions := 20
@@ -217,11 +211,7 @@ func TestDispatcher_MultipleSessionsConcurrent(t *testing.T) {
 		go func(sid string) {
 			defer wg.Done()
 			for i := 0; i < tasksPerSession; i++ {
-				task := &types.Task{
-					ID:        fmt.Sprintf("%s-task%d", sid, i),
-					SessionID: sid,
-					Payload:   i,
-				}
+				task := createTestTask(fmt.Sprintf("%s-task%d", sid, i), sid, i, 5*time.Millisecond, tracker)
 				err := d.Submit(context.Background(), task)
 				assert.NoError(t, err)
 			}
@@ -243,38 +233,33 @@ func TestDispatcher_MultipleSessionsConcurrent(t *testing.T) {
 	// Verify each session's tasks are in order
 	for s := 0; s < numSessions; s++ {
 		sessionID := fmt.Sprintf("session%d", s)
-		executedTasks := handler.GetExecutedTasks(sessionID)
+		executedTasks := tracker.GetExecutedTaskIDs(sessionID)
 
 		// Verify order
-		for i, task := range executedTasks {
+		for i, taskID := range executedTasks {
 			expectedID := fmt.Sprintf("%s-task%d", sessionID, i)
-			assert.Equal(t, expectedID, task.ID)
+			assert.Equal(t, expectedID, taskID)
 		}
 	}
 }
 
 func TestDispatcher_LoadBalancing(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    5,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
-		ShutdownTimeout: 5 * time.Second,
+		PoolSize:         5,
+		QueueSize:        100,
+		TaskTimeout:      5 * time.Second,
+		ShutdownTimeout:  5 * time.Second,
 		VirtualNodeCount: 150,
 	}
-	handler := NewMockHandler(5 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
 
 	// Submit tasks from many sessions
 	numSessions := 100
 	for s := 0; s < numSessions; s++ {
-		task := &types.Task{
-			ID:        fmt.Sprintf("task%d", s),
-			SessionID: fmt.Sprintf("session%d", s),
-			Payload:   s,
-		}
+		task := createTestTask(fmt.Sprintf("task%d", s), fmt.Sprintf("session%d", s), s, 5*time.Millisecond, nil)
 		err := d.Submit(context.Background(), task)
 		require.NoError(t, err)
 	}
@@ -304,23 +289,18 @@ func TestDispatcher_LoadBalancing(t *testing.T) {
 
 func TestDispatcher_Shutdown(t *testing.T) {
 	config := &types.WorkerConfig{
-		PoolSize:    3,
-		QueueSize:   100,
-		TaskTimeout: 5 * time.Second,
+		PoolSize:        3,
+		QueueSize:       100,
+		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(10 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 
 	// Submit some tasks
 	for i := 0; i < 10; i++ {
-		task := &types.Task{
-			ID:        fmt.Sprintf("task%d", i),
-			SessionID: fmt.Sprintf("session%d", i%3),
-			Payload:   i,
-		}
+		task := createTestTask(fmt.Sprintf("task%d", i), fmt.Sprintf("session%d", i%3), i, 10*time.Millisecond, nil)
 		err := d.Submit(context.Background(), task)
 		require.NoError(t, err)
 	}
@@ -331,11 +311,7 @@ func TestDispatcher_Shutdown(t *testing.T) {
 	assert.False(t, d.IsRunning())
 
 	// Submitting after shutdown should fail
-	task := &types.Task{
-		ID:        "task-after-shutdown",
-		SessionID: "session1",
-		Payload:   "data",
-	}
+	task := createTestTask("task-after-shutdown", "session1", "data", 0, nil)
 	err = d.Submit(context.Background(), task)
 	assert.Error(t, err)
 	assert.Equal(t, types.ErrDispatcherClosed, err)
@@ -348,9 +324,8 @@ func TestDispatcher_AddWorker(t *testing.T) {
 		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(0)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
 
@@ -371,51 +346,7 @@ func TestDispatcher_AddWorker(t *testing.T) {
 	assert.Equal(t, 5, d.GetPoolSize())
 
 	// Verify new workers are functional
-	task := &types.Task{
-		ID:        "test-task",
-		SessionID: "test-session",
-		Payload:   "data",
-	}
-	err = d.Submit(context.Background(), task)
-	assert.NoError(t, err)
-}
-
-func TestDispatcher_RemoveWorker(t *testing.T) {
-	config := &types.WorkerConfig{
-		PoolSize:        5,
-		QueueSize:       100,
-		TaskTimeout:     5 * time.Second,
-		ShutdownTimeout: 5 * time.Second,
-	}
-	handler := NewMockHandler(10 * time.Millisecond)
-
-	d, err := NewDispatcher(config, handler)
-	require.NoError(t, err)
-	defer d.Shutdown(context.Background())
-
-	// Initial pool size
-	assert.Equal(t, 5, d.GetPoolSize())
-
-	// Get a worker ID
-	stats := d.GetWorkerStats()
-	require.Greater(t, len(stats), 0)
-	workerID := stats[0].WorkerID
-
-	// Remove the worker
-	err = d.RemoveWorker(context.Background(), workerID)
-	require.NoError(t, err)
-	assert.Equal(t, 4, d.GetPoolSize())
-
-	// Try to remove non-existent worker
-	err = d.RemoveWorker(context.Background(), "non-existent")
-	assert.Error(t, err)
-
-	// Verify remaining workers still work
-	task := &types.Task{
-		ID:        "test-task",
-		SessionID: "test-session",
-		Payload:   "data",
-	}
+	task := createTestTask("test-task", "test-session", "data", 0, nil)
 	err = d.Submit(context.Background(), task)
 	assert.NoError(t, err)
 }
@@ -427,9 +358,8 @@ func TestDispatcher_ResizePool(t *testing.T) {
 		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(10 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
 
@@ -441,15 +371,20 @@ func TestDispatcher_ResizePool(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 10, d.GetPoolSize())
 
-	// Scale down
-	err = d.ResizePool(context.Background(), 3)
+	// Scale up more
+	err = d.ResizePool(context.Background(), 15)
 	require.NoError(t, err)
-	assert.Equal(t, 3, d.GetPoolSize())
+	assert.Equal(t, 15, d.GetPoolSize())
 
 	// Same size (no-op)
-	err = d.ResizePool(context.Background(), 3)
+	err = d.ResizePool(context.Background(), 15)
 	require.NoError(t, err)
-	assert.Equal(t, 3, d.GetPoolSize())
+	assert.Equal(t, 15, d.GetPoolSize())
+
+	// Scale down should return error
+	err = d.ResizePool(context.Background(), 3)
+	assert.Error(t, err)
+	assert.Equal(t, 15, d.GetPoolSize()) // Size should remain unchanged
 
 	// Invalid size
 	err = d.ResizePool(context.Background(), 0)
@@ -460,11 +395,7 @@ func TestDispatcher_ResizePool(t *testing.T) {
 
 	// Verify dispatcher still works after resizing
 	for i := 0; i < 20; i++ {
-		task := &types.Task{
-			ID:        fmt.Sprintf("task-%d", i),
-			SessionID: fmt.Sprintf("session-%d", i%5),
-			Payload:   i,
-		}
+		task := createTestTask(fmt.Sprintf("task-%d", i), fmt.Sprintf("session-%d", i%5), i, 10*time.Millisecond, nil)
 		err = d.Submit(context.Background(), task)
 		assert.NoError(t, err)
 	}
@@ -483,9 +414,8 @@ func TestDispatcher_DynamicResizeUnderLoad(t *testing.T) {
 		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(20 * time.Millisecond)
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(t, err)
 	defer d.Shutdown(context.Background())
 
@@ -503,11 +433,7 @@ func TestDispatcher_DynamicResizeUnderLoad(t *testing.T) {
 			case <-ctx.Done():
 				return
 			default:
-				task := &types.Task{
-					ID:        fmt.Sprintf("task-%d", taskNum),
-					SessionID: fmt.Sprintf("session-%d", taskNum%10),
-					Payload:   taskNum,
-				}
+				task := createTestTask(fmt.Sprintf("task-%d", taskNum), fmt.Sprintf("session-%d", taskNum%10), taskNum, 20*time.Millisecond, nil)
 				d.Submit(context.Background(), task)
 				taskNum++
 				time.Sleep(5 * time.Millisecond)
@@ -525,10 +451,10 @@ func TestDispatcher_DynamicResizeUnderLoad(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	// Scale down while under load
-	err = d.ResizePool(context.Background(), 4)
+	// Scale up more while under load
+	err = d.ResizePool(context.Background(), 12)
 	require.NoError(t, err)
-	assert.Equal(t, 4, d.GetPoolSize())
+	assert.Equal(t, 12, d.GetPoolSize())
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -555,19 +481,14 @@ func BenchmarkDispatcher_Submit(b *testing.B) {
 		TaskTimeout:     5 * time.Second,
 		ShutdownTimeout: 5 * time.Second,
 	}
-	handler := NewMockHandler(0) // No delay
 
-	d, err := NewDispatcher(config, handler)
+	d, err := NewDispatcher(config)
 	require.NoError(b, err)
 	defer d.Shutdown(context.Background())
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		task := &types.Task{
-			ID:        fmt.Sprintf("task%d", i),
-			SessionID: fmt.Sprintf("session%d", i%100),
-			Payload:   i,
-		}
+		task := createTestTask(fmt.Sprintf("task%d", i), fmt.Sprintf("session%d", i%100), i, 0, nil)
 		d.Submit(context.Background(), task)
 	}
 }

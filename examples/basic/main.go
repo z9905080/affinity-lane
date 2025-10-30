@@ -11,47 +11,20 @@ import (
 	"github.com/z9905080/affinity-lane/pkg/types"
 )
 
-// SimpleTaskHandler is a basic implementation of TaskHandler
-type SimpleTaskHandler struct{}
-
-func (h *SimpleTaskHandler) Handle(ctx context.Context, task *types.Task) (*types.TaskResult, error) {
-	// Simulate some work
-	processingTime := time.Duration(rand.Intn(100)) * time.Millisecond
-
-	log.Printf("[%s] Processing task %s (session: %s, payload: %v)",
-		time.Now().Format("15:04:05.000"),
-		task.ID,
-		task.SessionID,
-		task.Payload,
-	)
-
-	time.Sleep(processingTime)
-
-	// Return successful result
-	return &types.TaskResult{
-		TaskID:    task.ID,
-		SessionID: task.SessionID,
-		Result:    fmt.Sprintf("Processed in %v", processingTime),
-	}, nil
-}
-
 func main() {
 	log.Println("Starting Worker Pool example...")
 
 	// Create configuration
 	config := &types.WorkerConfig{
-		PoolSize:         5,                  // 5 workers
-		QueueSize:        100,                // 100 tasks per session queue
-		TaskTimeout:      30 * time.Second,   // 30s timeout per task
-		ShutdownTimeout:  10 * time.Second,   // 10s shutdown timeout
-		VirtualNodeCount: 150,                // 150 virtual nodes for consistent hashing
+		PoolSize:         5,                // 5 workers
+		QueueSize:        100,              // 100 tasks per session queue
+		TaskTimeout:      30 * time.Second, // 30s timeout per task
+		ShutdownTimeout:  10 * time.Second, // 10s shutdown timeout
+		VirtualNodeCount: 150,              // 150 virtual nodes for consistent hashing
 	}
 
-	// Create task handler
-	handler := &SimpleTaskHandler{}
-
-	// Create dispatcher
-	d, err := dispatcher.NewDispatcher(config, handler)
+	// Create dispatcher (no handler needed anymore!)
+	d, err := dispatcher.NewDispatcher(config)
 	if err != nil {
 		log.Fatalf("Failed to create dispatcher: %v", err)
 	}
@@ -68,13 +41,32 @@ func main() {
 		sessionID := fmt.Sprintf("session-%d", s)
 
 		for t := 0; t < tasksPerSession; t++ {
-			task := &types.Task{
-				ID:        fmt.Sprintf("task-%d-%d", s, t),
+			taskID := fmt.Sprintf("task-%d-%d", s, t)
+
+			// Create task with generic payload (map)
+			task := &types.Task[map[string]any]{
+				ID:        taskID,
 				SessionID: sessionID,
-				Payload: map[string]interface{}{
+				Payload: map[string]any{
 					"session": sessionID,
 					"index":   t,
 					"data":    fmt.Sprintf("payload-%d-%d", s, t),
+				},
+				CreatedAt: time.Now(),
+				OnExecute: func(ctx context.Context, task *types.Task[map[string]any]) (any, error) {
+					// Simulate some work
+					processingTime := time.Duration(rand.Intn(100)) * time.Millisecond
+
+					log.Printf("[%s] Processing task %s (session: %s, payload: %v)",
+						time.Now().Format("15:04:05.000"),
+						task.ID,
+						task.SessionID,
+						task.Payload,
+					)
+
+					time.Sleep(processingTime)
+
+					return fmt.Sprintf("Processed in %v", processingTime), nil
 				},
 			}
 

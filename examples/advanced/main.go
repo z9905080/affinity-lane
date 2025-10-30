@@ -52,84 +52,10 @@ func (ot *OrderTracker) GetOrder(sessionID string) []string {
 	return append([]string{}, ot.sessions[sessionID]...)
 }
 
-// AdvancedTaskHandler demonstrates more complex task handling
-type AdvancedTaskHandler struct {
-	orderTracker *OrderTracker
-	resultChan   chan *types.TaskResult
-}
-
-func NewAdvancedTaskHandler(orderTracker *OrderTracker) *AdvancedTaskHandler {
-	return &AdvancedTaskHandler{
-		orderTracker: orderTracker,
-		resultChan:   make(chan *types.TaskResult, 1000),
-	}
-}
-
-func (h *AdvancedTaskHandler) Handle(ctx context.Context, task *types.Task) (*types.TaskResult, error) {
-	startTime := time.Now()
-
-	// Record execution order
-	h.orderTracker.RecordTask(task.SessionID, task.ID)
-
-	// Simulate different types of work based on payload
-	payload, ok := task.Payload.(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid payload type")
-	}
-
-	workType, _ := payload["type"].(string)
-
-	var processingTime time.Duration
-	var result interface{}
-
-	switch workType {
-	case "fast":
-		processingTime = 10 * time.Millisecond
-		result = "fast work completed"
-	case "slow":
-		processingTime = 100 * time.Millisecond
-		result = "slow work completed"
-	case "compute":
-		// Simulate CPU-intensive work
-		sum := 0
-		for i := 0; i < 1000000; i++ {
-			sum += i
-		}
-		result = fmt.Sprintf("computed sum: %d", sum)
-	default:
-		processingTime = 50 * time.Millisecond
-		result = "default work completed"
-	}
-
-	if processingTime > 0 {
-		time.Sleep(processingTime)
-	}
-
-	taskResult := &types.TaskResult{
-		TaskID:    task.ID,
-		SessionID: task.SessionID,
-		Result:    result,
-		StartedAt: startTime,
-		EndedAt:   time.Now(),
-		Duration:  time.Since(startTime),
-	}
-
-	// Send result to channel
-	select {
-	case h.resultChan <- taskResult:
-	default:
-		log.Printf("Result channel full, dropping result for task %s", task.ID)
-	}
-
-	return taskResult, nil
-}
-
-func (h *AdvancedTaskHandler) GetResultChan() <-chan *types.TaskResult {
-	return h.resultChan
-}
-
-func (h *AdvancedTaskHandler) Close() {
-	close(h.resultChan)
+// TaskPayload represents the payload for advanced tasks
+type TaskPayload struct {
+	Type  string
+	Index int
 }
 
 func main() {
@@ -153,14 +79,14 @@ func main() {
 		VirtualNodeCount: 200,
 	}
 
-	// Create handler
-	handler := NewAdvancedTaskHandler(orderTracker)
-
-	// Create dispatcher
-	d, err := dispatcher.NewDispatcher(config, handler)
+	// Create dispatcher (no handler needed anymore!)
+	d, err := dispatcher.NewDispatcher(config)
 	if err != nil {
 		log.Fatalf("Failed to create dispatcher: %v", err)
 	}
+
+	// Create result channel for collecting results
+	resultChan := make(chan *types.TaskResult[any], 1000)
 
 	// Start result collector
 	var wg sync.WaitGroup
@@ -168,7 +94,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 		completedCount := 0
-		for range handler.GetResultChan() {
+		for range resultChan {
 			completedCount++
 			if completedCount%100 == 0 {
 				log.Printf("Collected %d results", completedCount)
@@ -185,12 +111,40 @@ func main() {
 		taskID := fmt.Sprintf("ordered-task-%d", i)
 		expectedOrder[i] = taskID
 
-		task := &types.Task{
+		task := &types.Task[TaskPayload]{
 			ID:        taskID,
 			SessionID: testSession,
-			Payload: map[string]interface{}{
-				"type":  "fast",
-				"index": i,
+			Payload: TaskPayload{
+				Type:  "fast",
+				Index: i,
+			},
+			CreatedAt: time.Now(),
+			OnExecute: func(ctx context.Context, t *types.Task[TaskPayload]) (any, error) {
+				startTime := time.Now()
+
+				// Record execution order
+				orderTracker.RecordTask(t.SessionID, t.ID)
+
+				// Fast task - 10ms processing
+				time.Sleep(10 * time.Millisecond)
+				result := "fast work completed"
+
+				// Send result to channel
+				taskResult := &types.TaskResult[any]{
+					TaskID:    t.ID,
+					SessionID: t.SessionID,
+					Result:    result,
+					StartedAt: startTime,
+					EndedAt:   time.Now(),
+					Duration:  time.Since(startTime),
+				}
+				select {
+				case resultChan <- taskResult:
+				default:
+					log.Printf("Result channel full, dropping result for task %s", t.ID)
+				}
+
+				return result, nil
 			},
 		}
 		d.Submit(context.Background(), task)
@@ -225,12 +179,64 @@ func main() {
 			taskTypes := []string{"fast", "slow", "compute", "default"}
 
 			for t := 0; t < tasksPerSession; t++ {
-				task := &types.Task{
+				taskType := taskTypes[t%len(taskTypes)]
+				task := &types.Task[TaskPayload]{
 					ID:        fmt.Sprintf("task-%d-%d", sessionIdx, t),
 					SessionID: sessionID,
-					Payload: map[string]interface{}{
-						"type":  taskTypes[t%len(taskTypes)],
-						"index": t,
+					Payload: TaskPayload{
+						Type:  taskType,
+						Index: t,
+					},
+					CreatedAt: time.Now(),
+					OnExecute: func(ctx context.Context, task *types.Task[TaskPayload]) (any, error) {
+						startTime := time.Now()
+
+						// Record execution order
+						orderTracker.RecordTask(task.SessionID, task.ID)
+
+						// Simulate different types of work based on payload
+						var processingTime time.Duration
+						var result any
+
+						switch task.Payload.Type {
+						case "fast":
+							processingTime = 10 * time.Millisecond
+							result = "fast work completed"
+						case "slow":
+							processingTime = 100 * time.Millisecond
+							result = "slow work completed"
+						case "compute":
+							// Simulate CPU-intensive work
+							sum := 0
+							for i := 0; i < 1000000; i++ {
+								sum += i
+							}
+							result = fmt.Sprintf("computed sum: %d", sum)
+						default:
+							processingTime = 50 * time.Millisecond
+							result = "default work completed"
+						}
+
+						if processingTime > 0 {
+							time.Sleep(processingTime)
+						}
+
+						// Send result to channel
+						taskResult := &types.TaskResult[any]{
+							TaskID:    task.ID,
+							SessionID: task.SessionID,
+							Result:    result,
+							StartedAt: startTime,
+							EndedAt:   time.Now(),
+							Duration:  time.Since(startTime),
+						}
+						select {
+						case resultChan <- taskResult:
+						default:
+							log.Printf("Result channel full, dropping result for task %s", task.ID)
+						}
+
+						return result, nil
 					},
 				}
 
@@ -356,8 +362,8 @@ func main() {
 		log.Println("Dispatcher shut down successfully!")
 	}
 
-	// Close handler and wait for result collector
-	handler.Close()
+	// Close result channel and wait for result collector
+	close(resultChan)
 	wg.Wait()
 
 	log.Println("\n=== Example Complete ===")

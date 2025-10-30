@@ -25,6 +25,7 @@ var (
 	ErrWorkerBusy     = errors.New("worker is busy")
 	ErrTaskTimeout    = errors.New("task execution timeout")
 	ErrTaskPanic      = errors.New("task execution panicked")
+	ErrNoExecutor     = errors.New("task has no executor function")
 )
 
 // Session errors

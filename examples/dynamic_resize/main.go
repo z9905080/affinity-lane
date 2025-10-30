@@ -12,24 +12,9 @@ import (
 	"github.com/z9905080/affinity-lane/pkg/types"
 )
 
-// SimpleHandler implements a basic task handler
-type SimpleHandler struct{}
-
-func (h *SimpleHandler) Handle(ctx context.Context, task *types.Task) (*types.TaskResult, error) {
-	// Simulate variable processing time
-	processingTime := time.Duration(rand.Intn(50)) * time.Millisecond
-	time.Sleep(processingTime)
-
-	return &types.TaskResult{
-		TaskID:    task.ID,
-		SessionID: task.SessionID,
-		Result:    fmt.Sprintf("Processed by worker in %v", processingTime),
-	}, nil
-}
-
 func main() {
 	log.Println("========================================")
-	log.Println("  Dynamic Worker Pool Resizing Demo")
+	log.Println("  Dynamic Worker Pool Scale-Up Demo")
 	log.Println("========================================")
 	log.Println()
 
@@ -42,10 +27,8 @@ func main() {
 		VirtualNodeCount: 150,
 	}
 
-	handler := &SimpleHandler{}
-
 	// 創建 dispatcher
-	d, err := dispatcher.NewDispatcher(config, handler)
+	d, err := dispatcher.NewDispatcher(config)
 	if err != nil {
 		log.Fatalf("Failed to create dispatcher: %v", err)
 	}
@@ -57,8 +40,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var taskCounter sync.Mutex
-	var totalSubmitted int
+	var (
+		taskCounter    sync.Mutex
+		totalSubmitted int
+		submitErrors   sync.Map // track submit errors
+	)
 
 	taskSubmitter := func(rate int) {
 		ticker := time.NewTicker(time.Duration(1000/rate) * time.Millisecond)
@@ -74,14 +60,25 @@ func main() {
 				totalSubmitted++
 				taskCounter.Unlock()
 
-				task := &types.Task{
+				task := &types.Task[map[string]any]{
 					ID:        fmt.Sprintf("task-%d", taskNum),
 					SessionID: fmt.Sprintf("session-%d", taskNum%20),
-					Payload: map[string]interface{}{
+					Payload: map[string]any{
 						"index": taskNum,
 					},
+					CreatedAt: time.Now(),
+					OnExecute: func(ctx context.Context, task *types.Task[map[string]any]) (any, error) {
+						// Simulate variable processing time
+						processingTime := time.Duration(rand.Intn(50)) * time.Millisecond
+						time.Sleep(processingTime)
+						return fmt.Sprintf("Processed by worker in %v", processingTime), nil
+					},
 				}
-				d.Submit(context.Background(), task)
+				err := d.Submit(context.Background(), task)
+				if err != nil {
+					// Track errors
+					submitErrors.Store(taskNum, err.Error())
+				}
 			}
 		}
 	}
@@ -155,66 +152,54 @@ func main() {
 	time.Sleep(5 * time.Second)
 
 	// ========================================
-	// 場景 4: 負載降低 - 縮容
-	// ========================================
-	log.Println("\n=== Scenario 4: Load Decreasing - Scale Down ===")
-	log.Println("Load decreasing... Scaling down to 6 workers")
-
-	currentRate = 15 // 降低到 15 tasks/second
-
-	// 逐步縮容
-	targetSize := 6
-	workerStats := d.GetWorkerStats()
-
-	for d.GetPoolSize() > targetSize && len(workerStats) > 0 {
-		// 選擇第一個 worker 移除
-		workerID := workerStats[0].WorkerID
-		err := d.RemoveWorker(context.Background(), workerID)
-		if err != nil {
-			log.Printf("Failed to remove worker: %v", err)
-		} else {
-			log.Printf("  ➖ Removed worker: %s (Pool size: %d)", workerID, d.GetPoolSize())
-		}
-
-		// 更新 worker 列表
-		workerStats = d.GetWorkerStats()
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	log.Printf("✓ Scale down completed. Current pool size: %d\n", d.GetPoolSize())
-	time.Sleep(5 * time.Second)
-
-	// ========================================
-	// 場景 5: 回到低負載 - 進一步縮容
-	// ========================================
-	log.Println("\n=== Scenario 5: Back to Low Load - Scale Down More ===")
-	log.Println("Returning to low load... Scaling down to 3 workers")
-
-	currentRate = 10 // 回到 10 tasks/second
-
-	// 使用 ResizePool 快速縮容
-	err = d.ResizePool(context.Background(), 3)
-	if err != nil {
-		log.Printf("Failed to resize pool: %v", err)
-	} else {
-		log.Printf("✓ Quickly scaled down to %d workers\n", d.GetPoolSize())
-	}
-
-	time.Sleep(5 * time.Second)
-
-	// ========================================
 	// 最終統計
 	// ========================================
 	log.Println("\n=== Final Statistics ===")
 
 	// 停止任務提交
 	cancel()
-	time.Sleep(2 * time.Second) // 等待最後的任務完成
+	log.Println("Stopped task submission. Waiting for all queued tasks to complete...")
+
+	// 等待所有已提交的任務完成
+	maxWaitTime := 30 * time.Second
+	checkInterval := 500 * time.Millisecond
+	startWait := time.Now()
+
+	for {
+		stats := d.Stats()
+		if stats.TotalSubmitted == stats.TotalCompleted {
+			log.Printf("✓ All tasks completed! (%d/%d)", stats.TotalCompleted, stats.TotalSubmitted)
+			break
+		}
+
+		if time.Since(startWait) > maxWaitTime {
+			log.Printf("⚠ Timeout waiting for tasks to complete. Completed: %d/%d",
+				stats.TotalCompleted, stats.TotalSubmitted)
+			break
+		}
+
+		log.Printf("  Waiting... Completed: %d/%d, Queued: %d",
+			stats.TotalCompleted, stats.TotalSubmitted, stats.QueuedTasks)
+		time.Sleep(checkInterval)
+	}
+
+	// Count submit errors
+	var submitErrorCount int
+	submitErrors.Range(func(key, value any) bool {
+		submitErrorCount++
+		if submitErrorCount <= 10 {
+			log.Printf("  Submit error for task-%v: %v", key, value)
+		}
+		return true
+	})
 
 	finalStats := d.Stats()
-	log.Printf("Total Submitted: %d", finalStats.TotalSubmitted)
+	log.Printf("\nTotal Submitted: %d", finalStats.TotalSubmitted)
 	log.Printf("Total Completed: %d", finalStats.TotalCompleted)
 	log.Printf("Total Failed: %d", finalStats.TotalFailed)
+	if submitErrorCount > 0 {
+		log.Printf("Submit Errors: %d (tasks that failed to submit)", submitErrorCount)
+	}
 	log.Printf("Success Rate: %.2f%%",
 		float64(finalStats.TotalCompleted)/float64(finalStats.TotalSubmitted)*100)
 	log.Printf("Final Pool Size: %d", d.GetPoolSize())
@@ -222,7 +207,7 @@ func main() {
 
 	// Worker 分布
 	log.Println("\n=== Worker Statistics ===")
-	workerStats = d.GetWorkerStats()
+	workerStats := d.GetWorkerStats()
 	for _, ws := range workerStats {
 		log.Printf("Worker %s: Processed=%d, Sessions=%d, Failed=%d, AvgDuration=%v",
 			ws.WorkerID,
@@ -245,7 +230,7 @@ func main() {
 	log.Println("========================================")
 	log.Println()
 	log.Println("Key Takeaways:")
-	log.Println("  ✓ Dynamic resizing works seamlessly")
+	log.Println("  ✓ Dynamic scale-up works seamlessly")
 	log.Println("  ✓ No task loss during scaling")
 	log.Println("  ✓ Session affinity maintained")
 	log.Println("  ✓ Zero downtime scaling")

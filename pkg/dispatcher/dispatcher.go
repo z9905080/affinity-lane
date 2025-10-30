@@ -15,7 +15,6 @@ import (
 // Dispatcher distributes tasks to workers based on session affinity
 type Dispatcher struct {
 	config         *types.WorkerConfig
-	handler        types.TaskHandler
 	sessionManager *session.Manager
 	workers        map[string]*worker.Worker
 	workersMu      sync.RWMutex // protects workers map
@@ -33,7 +32,7 @@ type Dispatcher struct {
 }
 
 // NewDispatcher creates a new dispatcher
-func NewDispatcher(config *types.WorkerConfig, handler types.TaskHandler) (*Dispatcher, error) {
+func NewDispatcher(config *types.WorkerConfig) (*Dispatcher, error) {
 	if config == nil {
 		config = types.DefaultConfig()
 	}
@@ -42,13 +41,8 @@ func NewDispatcher(config *types.WorkerConfig, handler types.TaskHandler) (*Disp
 		return nil, err
 	}
 
-	if handler == nil {
-		return nil, fmt.Errorf("task handler cannot be nil")
-	}
-
 	d := &Dispatcher{
 		config:         config,
-		handler:        handler,
 		sessionManager: session.NewManager(config.VirtualNodeCount),
 		workers:        make(map[string]*worker.Worker),
 		stopCh:         make(chan struct{}),
@@ -71,7 +65,7 @@ func (d *Dispatcher) initializeWorkers() error {
 		workerID := fmt.Sprintf("worker-%d", i)
 		d.nextWorkerID.Store(int64(i))
 
-		w := worker.New(workerID, d.config, d.handler)
+		w := worker.New(workerID, d.config)
 		d.workers[workerID] = w
 
 		// Add worker to session manager
@@ -87,22 +81,17 @@ func (d *Dispatcher) initializeWorkers() error {
 }
 
 // Submit submits a task to the dispatcher
-func (d *Dispatcher) Submit(ctx context.Context, task *types.Task) error {
+func (d *Dispatcher) Submit(ctx context.Context, task types.InfTask) error {
 	if !d.running.Load() {
 		return types.ErrDispatcherClosed
 	}
 
-	if task == nil || task.SessionID == "" || task.ID == "" {
+	if task == nil || task.GetSessionID() == "" || task.GetID() == "" {
 		return types.ErrInvalidTask
 	}
 
-	// Set creation time if not set
-	if task.CreatedAt.IsZero() {
-		task.CreatedAt = time.Now()
-	}
-
 	// Get worker for this session
-	workerID, err := d.sessionManager.GetWorkerForSession(task.SessionID)
+	workerID, err := d.sessionManager.GetWorkerForSession(task.GetSessionID())
 	if err != nil {
 		return err
 	}
@@ -123,13 +112,13 @@ func (d *Dispatcher) Submit(ctx context.Context, task *types.Task) error {
 
 	// Update statistics
 	d.totalSubmitted.Add(1)
-	d.sessionManager.RecordTask(task.SessionID)
+	d.sessionManager.RecordTask(task.GetSessionID())
 
 	return nil
 }
 
 // SubmitBatch submits multiple tasks in batch
-func (d *Dispatcher) SubmitBatch(ctx context.Context, tasks []*types.Task) error {
+func (d *Dispatcher) SubmitBatch(ctx context.Context, tasks []types.InfTask) error {
 	if !d.running.Load() {
 		return types.ErrDispatcherClosed
 	}
@@ -137,7 +126,7 @@ func (d *Dispatcher) SubmitBatch(ctx context.Context, tasks []*types.Task) error
 	// Submit each task
 	for _, task := range tasks {
 		if err := d.Submit(ctx, task); err != nil {
-			return fmt.Errorf("failed to submit task %s: %w", task.ID, err)
+			return fmt.Errorf("failed to submit task %s: %w", task.GetID(), err)
 		}
 	}
 
@@ -193,46 +182,24 @@ func (d *Dispatcher) Stats() *types.DispatcherStats {
 	d.workersMu.RLock()
 	queuedTasks := 0
 	workerCount := len(d.workers)
+	var totalCompleted, totalFailed int64
+
 	for _, w := range d.workers {
 		stats := w.Stats()
 		queuedTasks += stats.QueueLength
+		totalCompleted += stats.TasksProcessed
+		totalFailed += stats.TasksFailed
 	}
 	d.workersMu.RUnlock()
 
 	return &types.DispatcherStats{
 		TotalSubmitted: d.totalSubmitted.Load(),
-		TotalCompleted: d.getTotalCompleted(),
-		TotalFailed:    d.getTotalFailed(),
+		TotalCompleted: totalCompleted,
+		TotalFailed:    totalFailed,
 		ActiveSessions: d.sessionManager.GetActiveSessions(),
 		QueuedTasks:    queuedTasks,
 		Workers:        workerCount,
 	}
-}
-
-// getTotalCompleted returns total completed tasks across all workers
-func (d *Dispatcher) getTotalCompleted() int64 {
-	d.workersMu.RLock()
-	defer d.workersMu.RUnlock()
-
-	var total int64
-	for _, w := range d.workers {
-		stats := w.Stats()
-		total += stats.TasksProcessed
-	}
-	return total
-}
-
-// getTotalFailed returns total failed tasks across all workers
-func (d *Dispatcher) getTotalFailed() int64 {
-	d.workersMu.RLock()
-	defer d.workersMu.RUnlock()
-
-	var total int64
-	for _, w := range d.workers {
-		stats := w.Stats()
-		total += stats.TasksFailed
-	}
-	return total
 }
 
 // GetWorkerStats returns statistics for all workers
@@ -299,7 +266,7 @@ func (d *Dispatcher) AddWorker(ctx context.Context) (string, error) {
 	workerID := fmt.Sprintf("worker-%d", workerNum)
 
 	// Create new worker
-	w := worker.New(workerID, d.config, d.handler)
+	w := worker.New(workerID, d.config)
 
 	// Start worker
 	if err := w.Start(ctx); err != nil {
@@ -317,38 +284,7 @@ func (d *Dispatcher) AddWorker(ctx context.Context) (string, error) {
 	return workerID, nil
 }
 
-// RemoveWorker removes a worker from the pool
-func (d *Dispatcher) RemoveWorker(ctx context.Context, workerID string) error {
-	if !d.running.Load() {
-		return types.ErrDispatcherClosed
-	}
-
-	// Get worker (with read lock first)
-	d.workersMu.RLock()
-	w, exists := d.workers[workerID]
-	d.workersMu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("worker %s not found", workerID)
-	}
-
-	// Stop worker
-	if err := w.Stop(ctx); err != nil {
-		return fmt.Errorf("failed to stop worker %s: %w", workerID, err)
-	}
-
-	// Remove from session manager first (to stop routing new tasks)
-	d.sessionManager.RemoveWorker(workerID)
-
-	// Remove from workers map (with write lock)
-	d.workersMu.Lock()
-	delete(d.workers, workerID)
-	d.workersMu.Unlock()
-
-	return nil
-}
-
-// ResizePool adjusts the pool to the target size
+// ResizePool adjusts the pool size (only supports scaling up)
 func (d *Dispatcher) ResizePool(ctx context.Context, targetSize int) error {
 	if !d.running.Load() {
 		return types.ErrDispatcherClosed
@@ -364,34 +300,15 @@ func (d *Dispatcher) ResizePool(ctx context.Context, targetSize int) error {
 		return nil // Already at target size
 	}
 
-	if targetSize > currentSize {
-		// Add workers
-		numToAdd := targetSize - currentSize
-		for i := 0; i < numToAdd; i++ {
-			if _, err := d.AddWorker(ctx); err != nil {
-				return fmt.Errorf("failed to add worker: %w", err)
-			}
-		}
-	} else {
-		// Remove workers
-		numToRemove := currentSize - targetSize
+	if targetSize < currentSize {
+		return fmt.Errorf("scaling down is not supported; current size: %d, target size: %d", currentSize, targetSize)
+	}
 
-		// Get list of workers to remove
-		d.workersMu.RLock()
-		workersToRemove := make([]string, 0, numToRemove)
-		for workerID := range d.workers {
-			if len(workersToRemove) >= numToRemove {
-				break
-			}
-			workersToRemove = append(workersToRemove, workerID)
-		}
-		d.workersMu.RUnlock()
-
-		// Remove selected workers
-		for _, workerID := range workersToRemove {
-			if err := d.RemoveWorker(ctx, workerID); err != nil {
-				return fmt.Errorf("failed to remove worker %s: %w", workerID, err)
-			}
+	// Add workers
+	numToAdd := targetSize - currentSize
+	for i := 0; i < numToAdd; i++ {
+		if _, err := d.AddWorker(ctx); err != nil {
+			return fmt.Errorf("failed to add worker: %w", err)
 		}
 	}
 

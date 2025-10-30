@@ -12,9 +12,8 @@ import (
 
 // Worker processes tasks for multiple sessions
 type Worker struct {
-	id            string
-	config        *types.WorkerConfig
-	handler       types.TaskHandler
+	id     string
+	config *types.WorkerConfig
 
 	// Session queues: sessionID -> task channel
 	sessionQueues sync.Map
@@ -25,31 +24,30 @@ type Worker struct {
 	totalDuration  atomic.Int64 // nanoseconds
 
 	// Control channels
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	stopCh chan struct{}
+	doneCh chan struct{}
 
 	// State
-	running  atomic.Bool
-	mu       sync.RWMutex
+	running atomic.Bool
+	mu      sync.RWMutex
 }
 
 // sessionQueue represents a queue for a single session
 type sessionQueue struct {
 	sessionID string
-	taskCh    chan *types.Task
+	taskCh    chan types.InfTask
 	ctx       context.Context
 	cancel    context.CancelFunc
 	active    atomic.Bool
 }
 
 // New creates a new worker
-func New(id string, config *types.WorkerConfig, handler types.TaskHandler) *Worker {
+func New(id string, config *types.WorkerConfig) *Worker {
 	return &Worker{
-		id:      id,
-		config:  config,
-		handler: handler,
-		stopCh:  make(chan struct{}),
-		doneCh:  make(chan struct{}),
+		id:     id,
+		config: config,
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
 	}
 }
 
@@ -81,17 +79,17 @@ func (w *Worker) Stop(ctx context.Context) error {
 }
 
 // AddTask adds a task to the worker's queue
-func (w *Worker) AddTask(task *types.Task) error {
+func (w *Worker) AddTask(task types.InfTask) error {
 	if !w.running.Load() {
 		return types.ErrWorkerStopped
 	}
 
-	if task == nil || task.SessionID == "" {
+	if task == nil || task.GetSessionID() == "" {
 		return types.ErrInvalidTask
 	}
 
 	// Get or create session queue
-	queue := w.getOrCreateSessionQueue(task.SessionID)
+	queue := w.getOrCreateSessionQueue(task.GetSessionID())
 
 	// Try to send task to queue (non-blocking)
 	select {
@@ -113,7 +111,7 @@ func (w *Worker) getOrCreateSessionQueue(sessionID string) *sessionQueue {
 	ctx, cancel := context.WithCancel(context.Background())
 	queue := &sessionQueue{
 		sessionID: sessionID,
-		taskCh:    make(chan *types.Task, w.config.QueueSize),
+		taskCh:    make(chan types.InfTask, w.config.QueueSize),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -201,7 +199,7 @@ func (w *Worker) drainQueue(queue *sessionQueue) {
 }
 
 // executeTask executes a single task with timeout and panic recovery
-func (w *Worker) executeTask(ctx context.Context, task *types.Task) {
+func (w *Worker) executeTask(ctx context.Context, task types.InfTask) {
 	startTime := time.Now()
 
 	// Create context with timeout
@@ -209,13 +207,13 @@ func (w *Worker) executeTask(ctx context.Context, task *types.Task) {
 	defer cancel()
 
 	// Execute with panic recovery
-	result := w.safeExecute(taskCtx, task, startTime)
+	err := w.safeExecute(taskCtx, task)
 
 	// Update statistics
-	duration := result.Duration
+	duration := time.Since(startTime)
 	w.totalDuration.Add(duration.Nanoseconds())
 
-	if result.Error != nil {
+	if err != nil {
 		w.tasksFailed.Add(1)
 	} else {
 		w.tasksProcessed.Add(1)
@@ -223,47 +221,23 @@ func (w *Worker) executeTask(ctx context.Context, task *types.Task) {
 }
 
 // safeExecute executes a task with panic recovery
-func (w *Worker) safeExecute(ctx context.Context, task *types.Task, startTime time.Time) *types.TaskResult {
-	var result *types.TaskResult
-	var err error
-
+func (w *Worker) safeExecute(ctx context.Context, task types.InfTask) (err error) {
 	// Panic recovery
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%w: %v", types.ErrTaskPanic, r)
-			result = &types.TaskResult{
-				TaskID:    task.ID,
-				SessionID: task.SessionID,
-				Error:     err,
-				StartedAt: startTime,
-				EndedAt:   time.Now(),
-				Duration:  time.Since(startTime),
-			}
 		}
 	}()
 
 	// Execute task
-	result, err = w.handler.Handle(ctx, task)
+	_, err = task.Execute(ctx)
 
 	// Handle timeout
 	if ctx.Err() == context.DeadlineExceeded {
 		err = types.ErrTaskTimeout
 	}
 
-	// Create result if handler didn't return one
-	if result == nil {
-		result = &types.TaskResult{
-			TaskID:    task.ID,
-			SessionID: task.SessionID,
-		}
-	}
-
-	result.Error = err
-	result.StartedAt = startTime
-	result.EndedAt = time.Now()
-	result.Duration = time.Since(startTime)
-
-	return result
+	return err
 }
 
 // Stats returns worker statistics

@@ -5,19 +5,51 @@ import (
 	"time"
 )
 
-// Task represents a unit of work to be executed
-type Task struct {
+// InfTask defines the interface that all tasks must implement
+type InfTask interface {
+	GetID() string
+	GetSessionID() string
+	GetCreatedAt() time.Time
+	Execute(ctx context.Context) (any, error)
+}
+
+// Task represents a generic unit of work to be executed
+type Task[T any] struct {
 	ID        string      // Unique task identifier
 	SessionID string      // Session identifier for routing and ordering
-	Payload   interface{} // Task data
+	Payload   T           // Task data (generic type)
 	CreatedAt time.Time   // Task creation timestamp
+	OnExecute func(ctx context.Context, task *Task[T]) (any, error) // Execution function
+}
+
+// GetID returns the task ID
+func (t *Task[T]) GetID() string {
+	return t.ID
+}
+
+// GetSessionID returns the session ID
+func (t *Task[T]) GetSessionID() string {
+	return t.SessionID
+}
+
+// GetCreatedAt returns the task creation time
+func (t *Task[T]) GetCreatedAt() time.Time {
+	return t.CreatedAt
+}
+
+// Execute executes the task
+func (t *Task[T]) Execute(ctx context.Context) (any, error) {
+	if t.OnExecute != nil {
+		return t.OnExecute(ctx, t)
+	}
+	return nil, ErrNoExecutor
 }
 
 // TaskResult represents the result of task execution
-type TaskResult struct {
+type TaskResult[T any] struct {
 	TaskID    string        // Task ID
 	SessionID string        // Session ID
-	Result    interface{}   // Execution result
+	Result    T             // Execution result (generic type)
 	Error     error         // Error if execution failed
 	Duration  time.Duration // Execution duration
 	StartedAt time.Time     // Task start time
@@ -64,11 +96,6 @@ func (c *WorkerConfig) Validate() error {
 		c.VirtualNodeCount = 150 // default
 	}
 	return nil
-}
-
-// TaskHandler is the interface that users must implement to process tasks
-type TaskHandler interface {
-	Handle(ctx context.Context, task *Task) (*TaskResult, error)
 }
 
 // DispatcherStats provides statistics about the dispatcher
